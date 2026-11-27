@@ -805,6 +805,7 @@
 
     const uploadMediaFiles = async (files) => {
       if (!files || !files.length) return;
+      showToast("Loading media...");
       const fd = new FormData();
       Array.from(files).forEach((f) => fd.append("files", f));
       try {
@@ -814,6 +815,7 @@
         state.samples = d.samples;
         const up = d.uploaded || [];
         if (!up.length) return;
+        if (state.activeTab !== "live") switchTab("live");
         const vid = up.find((u) => u.media_type === "video");
         if (vid) {
           state.activeSource = vid.path;

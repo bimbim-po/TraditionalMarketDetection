@@ -98,36 +98,42 @@
     if (edge.sessionPromise) return edge.sessionPromise;
 
     edge.sessionPromise = (async () => {
-      await loadScriptOnce("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js");
-      window.ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
-      window.ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
+      try {
+        await loadScriptOnce("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js");
+        window.ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+        window.ort.env.wasm.numThreads = 1;
+        window.ort.env.wasm.simd = true;
 
-      const mRes = await origFetch("/model/manifest.json");
-      const manifest = await mRes.json();
-      edge.manifest = manifest;
-      edge.imgsz = manifest.imgsz || 480;
-      edge.names = manifest.names || edge.names;
-      if (manifest.samples && edge.samples.images.length === 0) {
-        edge.samples = JSON.parse(JSON.stringify(manifest.samples));
+        const mRes = await origFetch("/model/manifest.json");
+        const manifest = await mRes.json();
+        edge.manifest = manifest;
+        edge.imgsz = manifest.imgsz || 416;
+        edge.names = manifest.names || edge.names;
+        if (manifest.samples && edge.samples.images.length === 0) {
+          edge.samples = JSON.parse(JSON.stringify(manifest.samples));
+        }
+
+        // Parallel fetch of chunked best.pt ONNX weights from Cloudflare CDN
+        const buffers = await Promise.all(
+          manifest.chunks.map((c) => origFetch(c.file).then((r) => r.arrayBuffer()))
+        );
+        const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);
+        const merged = new Uint8Array(total);
+        let offset = 0;
+        for (const b of buffers) {
+          merged.set(new Uint8Array(b), offset);
+          offset += b.byteLength;
+        }
+
+        edge.ortSession = await window.ort.InferenceSession.create(merged, {
+          executionProviders: ["wasm"],
+          graphOptimizationLevel: "all",
+        });
+        return edge.ortSession;
+      } catch (err) {
+        edge.sessionPromise = null;
+        throw err;
       }
-
-      // Parallel fetch of chunked best.pt ONNX weights from Cloudflare CDN
-      const buffers = await Promise.all(
-        manifest.chunks.map((c) => origFetch(c.file).then((r) => r.arrayBuffer()))
-      );
-      const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);
-      const merged = new Uint8Array(total);
-      let offset = 0;
-      for (const b of buffers) {
-        merged.set(new Uint8Array(b), offset);
-        offset += b.byteLength;
-      }
-
-      edge.ortSession = await window.ort.InferenceSession.create(merged, {
-        executionProviders: ["webgl", "wasm"],
-        graphOptimizationLevel: "all",
-      });
-      return edge.ortSession;
     })();
 
     return edge.sessionPromise;
@@ -1288,16 +1294,21 @@
 
     async _runLoop(source) {
       try {
-        await ensureModelLoaded();
+        // Trigger model preload in background without blocking immediate video playback!
+        ensureModelLoaded().catch(() => {});
+
         const vid = document.createElement("video");
+        vid.preload = "auto";
         vid.src = resolveMediaUrl(source);
         vid.muted = true;
         vid.playsInline = true;
         this._vid = vid;
 
         await new Promise((res, rej) => {
-          vid.onloadedmetadata = res;
-          vid.onerror = () => rej(new Error("Video load error"));
+          vid.onloadeddata = res;
+          vid.onloadedmetadata = () => setTimeout(res, 120);
+          vid.onerror = () =>
+            rej(new Error("Format video tidak didukung browser (gunakan MP4 H.264 / WebM)."));
         });
 
         this._tracker = new JSByteTracker();
@@ -1477,7 +1488,9 @@
         const files = fd.getAll("files");
         const uploaded = [];
         for (const f of files) {
-          const isVid = /\.(mp4|mov|avi|webm)$/i.test(f.name);
+          const isVid =
+            (f.type && f.type.startsWith("video/")) ||
+            /\.(mp4|mov|avi|webm|mkv|m4v)$/i.test(f.name);
           const vpath = `uploads/${Date.now()}_${f.name}`;
           const objUrl = URL.createObjectURL(f);
           edge.uploadedBlobs[vpath] = objUrl;
