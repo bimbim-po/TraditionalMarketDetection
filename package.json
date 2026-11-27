@@ -1,0 +1,11 @@
+{
+  "name": "pasarvision-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PasarVision AI — Enterprise YOLOv11 Traditional Market Socio-Economic Analytics Platform",
+  "scripts": {
+    "start": "python run.py",
+    "dev": "python run.py --reload",
+    "deploy": "wrangler deploy"
+  }
+}

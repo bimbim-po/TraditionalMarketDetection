@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pasarvision — Market Analytics</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap"
+    rel="stylesheet"
+  />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/css/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+
+    <!-- ===================================================================
+         TOP BAR (Ethereal Capsule Header)
+         =================================================================== -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark"><span></span><span></span></div>
+        <span>pasarvision</span>
+      </div>
+
+      <nav class="nav-capsule">
+        <button data-tab="live" class="nav-tab active">Dashboard</button>
+        <button data-tab="compare" class="nav-tab">Compare</button>
+        <button data-tab="reports" class="nav-tab">Reports</button>
+      </nav>
+
+      <div class="topbar-actions">
+        <div class="status-pill" title="Active YOLOv11 Model">
+          <span id="model-status-dot" class="status-dot"></span>
+          <select
+            id="model-selector"
+            style="background:transparent;border:none;color:inherit;font:inherit;outline:none;cursor:pointer"
+          ></select>
+        </div>
+
+        <button id="btn-toggle-tune" class="icon-circle-btn" title="Settings & Thresholds">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <line x1="4" y1="6" x2="20" y2="6"></line>
+            <circle cx="9" cy="6" r="2.5" fill="#141621"></circle>
+            <line x1="4" y1="12" x2="20" y2="12"></line>
+            <circle cx="15" cy="12" r="2.5" fill="#141621"></circle>
+            <line x1="4" y1="18" x2="20" y2="18"></line>
+            <circle cx="10" cy="18" r="2.5" fill="#141621"></circle>
+          </svg>
+        </button>
+
+        <button id="btn-top-export" class="icon-circle-btn" title="Export Excel (.xlsx)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Fallback Warning Banner (Shown Automatically When yolo11n.pt Fallback Is Active) -->
+    <div id="fallback-warning-banner" class="fallback-banner hidden">
+      <span id="fallback-warning-text"></span>
+      <button id="btn-banner-upload-pt" class="pill-btn white" style="padding:5px 12px;flex-shrink:0">
+        Upload best.pt
+      </button>
+    </div>
+
+    <!-- ===================================================================
+         SUBHEADER & COMPACT PILL TOOLBAR
+         =================================================================== -->
+    <div class="subheader">
+      <h1 id="page-heading" class="page-title">My Dashboard</h1>
+
+      <div class="toolbar-strip">
+        <div class="seg-group">
+          <button id="btn-mode-image" class="seg-btn active">Image</button>
+          <button id="btn-mode-video" class="seg-btn">Video</button>
+          <button id="btn-mode-batch" class="seg-btn">Batch</button>
+        </div>
+
+        <select id="sample-selector" class="pill-select" title="Select Sample"></select>
+
+        <input
+          type="file"
+          id="input-media-files"
+          multiple
+          accept=".jpg,.jpeg,.png,.webp,.mp4,.avi,.mov"
+          class="hidden"
+        />
+        <button id="btn-upload-media" class="pill-btn white" title="Upload Foto atau Video (.mp4, .avi, .mov, .jpg, .png)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="17 8 12 3 7 8"></polyline>
+            <line x1="12" y1="3" x2="12" y2="15"></line>
+          </svg>
+          <span id="label-upload-media">Upload Video / Foto</span>
+        </button>
+
+        <select id="enhancement-method" class="pill-select" title="Image Enhancement">
+          <option value="none">Enhance: None</option>
+          <option value="clahe">Enhance: CLAHE</option>
+          <option value="he">Enhance: Hist Eq</option>
+          <option value="cs">Enhance: Stretch</option>
+          <option value="brightness_gamma">Enhance: Gamma</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ===================================================================
+         FLOATING TUNING POPOVER (Zero Screen Clutter Until Needed)
+         =================================================================== -->
+    <aside id="tune-popover" class="tune-popover hidden">
+      <div class="tune-section">
+        <div class="tune-label-row">
+          <span>Confidence</span>
+          <strong id="val-conf" class="num">0.35</strong>
+        </div>
+        <input id="slider-conf" type="range" min="0.10" max="0.90" step="0.05" value="0.35" class="sleek-range" />
+
+        <div class="tune-label-row">
+          <span>IoU NMS</span>
+          <strong id="val-iou" class="num">0.45</strong>
+        </div>
+        <input id="slider-iou" type="range" min="0.10" max="0.90" step="0.05" value="0.45" class="sleek-range" />
+      </div>
+
+      <!-- Dynamic Enhancement Sliders -->
+      <div id="params-clahe" class="tune-section hidden">
+        <div class="tune-label-row">
+          <span>CLAHE Clip</span>
+          <strong id="val-clahe-clip" class="num">2.5</strong>
+        </div>
+        <input id="slider-clahe-clip" type="range" min="1.0" max="6.0" step="0.1" value="2.5" class="sleek-range" />
+        <div class="tune-label-row">
+          <span>Tile Grid</span>
+          <select id="select-clahe-grid" class="pill-select" style="padding:4px 24px 4px 10px">
+            <option value="4">4×4</option>
+            <option value="8" selected>8×8</option>
+            <option value="16">16×16</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="params-cs" class="tune-section hidden">
+        <div class="tune-label-row">
+          <span>Low Clip</span>
+          <strong id="val-cs-low" class="num">2.0%</strong>
+        </div>
+        <input id="slider-cs-low" type="range" min="0.5" max="15.0" step="0.5" value="2.0" class="sleek-range" />
+        <div class="tune-label-row">
+          <span>High Clip</span>
+          <strong id="val-cs-high" class="num">98.0%</strong>
+        </div>
+        <input id="slider-cs-high" type="range" min="85.0" max="99.5" step="0.5" value="98.0" class="sleek-range" />
+      </div>
+
+      <div id="params-bg" class="tune-section hidden">
+        <div class="tune-label-row">
+          <span>Brightness</span>
+          <strong id="val-brightness" class="num">+18</strong>
+        </div>
+        <input id="slider-brightness" type="range" min="-50" max="80" step="1" value="18" class="sleek-range" />
+        <div class="tune-label-row">
+          <span>Contrast</span>
+          <strong id="val-contrast" class="num">1.15</strong>
+        </div>
+        <input id="slider-contrast" type="range" min="0.70" max="1.80" step="0.05" value="1.15" class="sleek-range" />
+        <div class="tune-label-row">
+          <span>Gamma</span>
+          <strong id="val-gamma" class="num">1.25</strong>
+        </div>
+        <input id="slider-gamma" type="range" min="0.50" max="2.00" step="0.05" value="1.25" class="sleek-range" />
+      </div>
+
+      <!-- Overlays -->
+      <div class="tune-section">
+        <label class="switch-row"><span>Boxes</span><input id="chk-show-boxes" type="checkbox" checked /></label>
+        <label class="switch-row"><span>Track IDs</span><input id="chk-show-ids" type="checkbox" checked /></label>
+        <label class="switch-row"><span>Trails</span><input id="chk-show-trails" type="checkbox" checked /></label>
+        <label class="switch-row"><span>Zone Overlay</span><input id="chk-show-roi" type="checkbox" checked /></label>
+      </div>
+
+      <!-- Dynamic Classes (Collapsible & Scrollable max-height 180px) -->
+      <div class="tune-section">
+        <details class="class-collapse" open>
+          <summary>
+            <span id="class-filter-summary">Class Filter (0/0)</span>
+            <span style="font-size:11px;color:#9ca3b8">▾</span>
+          </summary>
+          <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:11px">
+            <button id="btn-classes-all" style="background:none;border:none;color:#b8f69c;cursor:pointer;padding:0;font-weight:600">Select All</button>
+            <button id="btn-classes-none" style="background:none;border:none;color:#9ca3b8;cursor:pointer;padding:0;font-weight:600">Clear</button>
+          </div>
+          <div id="class-filter-list" class="chip-grid"></div>
+        </details>
+      </div>
+    </aside>
+
+    <!-- ===================================================================
+         TAB 1: DASHBOARD (Live Monitor + Ethereal Right Stack)
+         =================================================================== -->
+    <section id="tab-panel-live" class="bento-dashboard">
+      <!-- Left Main Vision Bento Card -->
+      <div class="bento-card stage-card">
+        <div id="viewport-stage" class="stage-viewport">
+          <!-- Floating Minimalist Top Pills -->
+          <div class="stage-top-overlay">
+            <div class="glass-pill num">
+              <span id="hud-fps">Static</span>
+              <span style="opacity:0.35">•</span>
+              <span id="hud-latency">0 ms</span>
+            </div>
+
+            <div style="display:flex;gap:6px;align-items:center">
+              <div id="roi-edit-subpanel" class="roi-subpanel hidden">
+                <button id="btn-roi-draw-new" class="pill-btn" style="padding:5px 11px;font-size:11px">Redraw</button>
+                <button id="btn-roi-reset" class="pill-btn" style="padding:5px 11px;font-size:11px">Reset</button>
+              </div>
+              <button id="btn-toggle-roi-edit" class="glass-pill" style="cursor:pointer;color:#f5f7fb">
+                <span id="label-toggle-roi-edit">Edit Zone</span>
+              </button>
+            </div>
+          </div>
+
+          <img id="main-viewport-img" class="viewport-img hidden" alt="Viewport" />
+          <canvas id="roi-editor-canvas"></canvas>
+
+          <div id="viewport-loader" class="loader-mask hidden">
+            <div class="spinner"></div>
+          </div>
+        </div>
+
+        <!-- Minimalist Bottom Bar -->
+        <div class="stage-bottom-bar">
+          <!-- Image Controls -->
+          <div id="image-controls-bar" class="image-bar">
+            <div style="display:flex;gap:8px">
+              <button id="btn-rerun-image" class="pill-btn">Refresh</button>
+              <button id="btn-open-in-lab" class="pill-btn lavender">Before / After</button>
+            </div>
+            <button id="btn-save-annotated-img" class="pill-btn">Snapshot</button>
+          </div>
+
+          <!-- Video Controls -->
+          <div id="video-controls-bar" class="video-bar hidden">
+            <button id="btn-vid-playpause" class="pill-btn white" style="min-width:74px;justify-content:center">
+              <span id="label-vid-playpause">Pause</span>
+            </button>
+            <button id="btn-vid-restart" class="pill-btn" title="Restart">↺</button>
+            <button id="btn-vid-stop" class="pill-btn" title="Stop">■</button>
+            <input id="slider-vid-progress" type="range" min="0" max="100" value="0" class="sleek-range" style="flex:1" />
+            <span id="vid-frame-label" class="num" style="font-size:11px;color:#9ca3b8;min-width:64px;text-align:right">0 / 0</span>
+            <button id="btn-vid-upload-inline" class="pill-btn">+ Video</button>
+            <button id="btn-export-mp4" class="pill-btn lavender">Save MP4</button>
+          </div>
+        </div>
+
+        <!-- Batch Strip -->
+        <div id="batch-filmstrip-panel" class="batch-strip hidden"></div>
+      </div>
+
+      <!-- Right Ethereal Bento Stack -->
+      <div class="right-stack">
+        <!-- 1. Hero Mint-Lime Card (Like "Total balance" in Reference) -->
+        <div class="hero-mint-card">
+          <div>
+            <div class="hero-label">Detected objects</div>
+            <div id="kpi-total-detected" class="hero-value num">0</div>
+            <div id="kpi-unique-sub" class="hero-sub num">0 tracked total</div>
+          </div>
+
+          <input type="file" id="input-model-file" accept=".pt,.onnx" class="hidden" />
+          <div class="hero-actions">
+            <button id="btn-export-excel" class="pill-btn ink">
+              <span id="label-export-excel">Export .xlsx</span>
+            </button>
+            <button id="btn-upload-model" class="pill-btn white">
+              Upload .pt
+            </button>
+          </div>
+        </div>
+
+        <!-- 2. Twin Metric Cards (Like "Income" & "Expense" in Reference) -->
+        <div class="metric-pair">
+          <div class="mini-bento">
+            <div class="mini-title">In Zone</div>
+            <div id="kpi-inside-roi" class="mini-value num">0</div>
+            <div class="mini-foot">
+              <span class="mini-caption">Entered</span>
+              <span id="kpi-roi-entered" class="badge-pill num">0</span>
+            </div>
+          </div>
+
+          <div class="mini-bento">
+            <div class="mini-title">Confidence</div>
+            <div id="kpi-avg-conf" class="mini-value num">0%</div>
+            <div class="mini-foot">
+              <span class="mini-caption">vs Raw</span>
+              <span id="kpi-conf-delta" class="badge-pill neutral num">0%</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3. Class Split Ring Card (Like "Expense split" in Reference) -->
+        <div class="bento-card split-card">
+          <div class="card-head">
+            <h3 class="card-title">Class split</h3>
+            <span id="active-model-short" class="tag-pill">—</span>
+          </div>
+
+          <div class="donut-layout">
+            <div class="donut-box">
+              <canvas id="chart-live-classes"></canvas>
+              <div class="donut-center">
+                <span>Total</span>
+                <strong id="donut-total-num" class="num">0</strong>
+              </div>
+            </div>
+            <div id="split-legend-grid" class="split-legend"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================
+         TAB 2: COMPARE (Before vs. After Enhancement Lab)
+         =================================================================== -->
+    <section id="tab-panel-compare" class="tab-stack hidden">
+      <!-- Top Visual Swipe / Split Card -->
+      <div class="bento-card" style="gap:14px">
+        <div class="card-head" style="flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:10px">
+            <h3 class="card-title">Before vs. After</h3>
+            <span id="lab-delta-pill" class="badge-pill num">+0 (0%)</span>
+            <span id="lab-conf-pill" class="tag-pill num">Conf +0.0%</span>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <button id="btn-quick-clahe" class="pill-btn lavender hidden">Apply CLAHE</button>
+
+            <select id="lab-sample-step" class="pill-select">
+              <option value="5">Step: 5f</option>
+              <option value="10" selected>Step: 10f</option>
+              <option value="15">Step: 15f</option>
+            </select>
+
+            <div class="seg-group">
+              <button id="btn-lab-swipe" class="seg-btn active">Swipe</button>
+              <button id="btn-lab-split" class="seg-btn">Split</button>
+            </div>
+
+            <button id="btn-run-comparison" class="pill-btn white">Run</button>
+          </div>
+        </div>
+
+        <div class="ba-stage">
+          <div id="lab-swipe-wrapper" style="position:relative;width:100%;height:100%;--swipe-pct:50%">
+            <img id="lab-swipe-after" class="ba-swipe-img" alt="After" />
+            <img id="lab-swipe-before" class="ba-swipe-img ba-before-clip" alt="Before" />
+            <div class="ba-line"></div>
+            <div class="ba-knob">↔</div>
+            <span class="glass-pill" style="position:absolute;bottom:12px;left:12px;z-index:14">Before</span>
+            <span id="lab-after-tag" class="glass-pill" style="position:absolute;bottom:12px;right:12px;z-index:14;color:#b8f69c">After</span>
+          </div>
+
+          <div id="lab-split-wrapper" class="ba-split-grid hidden">
+            <div class="ba-split-pane"><img id="lab-split-before" alt="Before" /></div>
+            <div class="ba-split-pane"><img id="lab-split-after" alt="After" /></div>
+          </div>
+
+          <div id="lab-loader" class="loader-mask hidden"><div class="spinner"></div></div>
+        </div>
+      </div>
+
+      <!-- Bottom 2 Bento Cards (Lavender Bar Flow + Ethereal Row Breakdown) -->
+      <div class="compare-grid">
+        <div class="bento-card" style="gap:12px">
+          <div class="card-head">
+            <h3 class="card-title">Class flow</h3>
+            <span class="tag-pill">Before / After</span>
+          </div>
+          <div style="height:230px;position:relative">
+            <canvas id="chart-ba-comparison"></canvas>
+          </div>
+        </div>
+
+        <div class="bento-card" style="gap:12px">
+          <div class="card-head">
+            <h3 class="card-title">Class breakdown</h3>
+            <button id="btn-lab-export" class="pill-btn" style="padding:5px 12px">Export .xlsx</button>
+          </div>
+          <div id="lab-class-rows" class="row-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================
+         TAB 3: REPORTS (Timeline, Zone Entries & Excel Archive)
+         =================================================================== -->
+    <section id="tab-panel-reports" class="tab-stack hidden">
+      <div class="bento-card" style="gap:12px">
+        <div class="card-head">
+          <h3 class="card-title">Detection flow</h3>
+          <button id="btn-rep-export" class="pill-btn white">Export .xlsx</button>
+        </div>
+        <div style="height:200px;position:relative">
+          <canvas id="chart-frame-timeline"></canvas>
+        </div>
+      </div>
+
+      <div class="compare-grid">
+        <div class="bento-card" style="gap:12px">
+          <div class="card-head">
+            <h3 class="card-title">Zone entries</h3>
+            <span class="tag-pill">ByteTrack</span>
+          </div>
+          <div id="roi-entries-list" class="row-list"></div>
+        </div>
+
+        <div class="bento-card" style="gap:12px">
+          <div class="card-head">
+            <h3 class="card-title">Saved exports</h3>
+            <button id="btn-refresh-reports" class="pill-btn" style="padding:4px 11px">Refresh</button>
+          </div>
+          <div id="reports-archive-list" class="row-list"></div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <div id="toast-container" class="toast-stack"></div>
+
+  <script src="/static/js/cloud_runtime.js"></script>
+  <script src="/static/js/roi_canvas.js"></script>
+  <script src="/static/js/charts.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

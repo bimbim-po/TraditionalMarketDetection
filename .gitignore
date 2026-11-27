@@ -1,0 +1,27 @@
+# Python bytecode & virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Hardware caches & auto-generated exports
+models/.ov_cache/
+models/*_openvino_model/
+models/yolo11n.pt
+models/yolo11n.onnx
+models/*.onnx
+
+# Cloudflare build bundle & Wrangler state
+.wrangler/
+cloud_dist/
+node_modules/
+
+# Runtime outputs & user media uploads
+outputs/*
+!outputs/.gitkeep
+
+# OS metadata
+.DS_Store
+Thumbs.db
