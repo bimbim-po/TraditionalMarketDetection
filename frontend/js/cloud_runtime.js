@@ -11,7 +11,8 @@
 
 (function () {
   const host = window.location.hostname;
-  const IS_LOCAL_FASTAPI = host === "127.0.0.1" || host === "localhost";
+  const forceEdge = new URLSearchParams(window.location.search).get("edge") === "1";
+  const IS_LOCAL_FASTAPI = (host === "127.0.0.1" || host === "localhost") && !forceEdge;
   if (IS_LOCAL_FASTAPI) return;
 
   const TARGET_CLASS_HEX = {
@@ -59,6 +60,8 @@
     manifest: null,
     ortSession: null,
     sessionPromise: null,
+    modelLoadingPct: 0,
+    inferMutex: Promise.resolve(),
     activeModelName: "best.pt",
     isFallback: false,
     imgsz: 480,
@@ -99,12 +102,13 @@
 
     edge.sessionPromise = (async () => {
       try {
-        await loadScriptOnce("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js");
-        window.ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+        await loadScriptOnce("/static/ort/ort.wasm.min.js");
+        window.ort.env.wasm.wasmPaths = "/static/ort/";
         window.ort.env.wasm.numThreads = 1;
         window.ort.env.wasm.simd = true;
 
-        const mRes = await origFetch("/model/manifest.json");
+        const mRes = await origFetch("/model/manifest_v3.json", { cache: "no-store" });
+        if (!mRes.ok) throw new Error("Failed to fetch model manifest_v3.json");
         const manifest = await mRes.json();
         edge.manifest = manifest;
         edge.imgsz = manifest.imgsz || 416;
@@ -113,10 +117,20 @@
           edge.samples = JSON.parse(JSON.stringify(manifest.samples));
         }
 
-        // Parallel fetch of chunked best.pt ONNX weights from Cloudflare CDN
+        let loadedCount = 0;
+        const totalChunks = manifest.chunks.length;
         const buffers = await Promise.all(
-          manifest.chunks.map((c) => origFetch(c.file).then((r) => r.arrayBuffer()))
+          manifest.chunks.map((c) =>
+            origFetch(c.file).then(async (r) => {
+              if (!r.ok) throw new Error(`Failed chunk ${c.file}`);
+              const ab = await r.arrayBuffer();
+              loadedCount++;
+              edge.modelLoadingPct = Math.round((loadedCount / totalChunks) * 100);
+              return ab;
+            })
+          )
         );
+
         const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);
         const merged = new Uint8Array(total);
         let offset = 0;
@@ -129,8 +143,10 @@
           executionProviders: ["wasm"],
           graphOptimizationLevel: "all",
         });
+        edge.modelLoadingPct = 100;
         return edge.ortSession;
       } catch (err) {
+        console.error("[PasarVision Edge] Model init failed:", err);
         edge.sessionPromise = null;
         throw err;
       }
@@ -142,10 +158,11 @@
   async function ensureManifestSamples() {
     if (edge.manifest) return;
     try {
-      const mRes = await origFetch("/model/manifest.json");
+      const mRes = await origFetch("/model/manifest_v3.json", { cache: "no-store" });
+      if (!mRes.ok) return;
       const manifest = await mRes.json();
       edge.manifest = manifest;
-      edge.imgsz = manifest.imgsz || 480;
+      edge.imgsz = manifest.imgsz || 416;
       edge.names = manifest.names || edge.names;
       if (manifest.samples && edge.samples.images.length === 0) {
         edge.samples = JSON.parse(JSON.stringify(manifest.samples));
@@ -491,7 +508,13 @@
   const letterCanvas = document.createElement("canvas");
   const letterCtx = letterCanvas.getContext("2d", { willReadFrequently: true });
 
-  async function runYoloOnCanvas(sourceCanvas, scoreFloor) {
+  function runYoloOnCanvas(sourceCanvas, scoreFloor) {
+    const task = edge.inferMutex.then(() => _runYoloOnCanvasInternal(sourceCanvas, scoreFloor));
+    edge.inferMutex = task.catch(() => {});
+    return task;
+  }
+
+  async function _runYoloOnCanvasInternal(sourceCanvas, scoreFloor) {
     const sess = await ensureModelLoaded();
     const w0 = sourceCanvas.width;
     const h0 = sourceCanvas.height;
@@ -1371,11 +1394,20 @@
                   activeTracked = this._tracker.update(rawDets, edge.conf);
                 }
               })
-              .catch(() => {})
+              .catch((err) => {
+                console.error("[PasarVision Edge Video Infer]", err);
+                if (!this._warnedErr && this.onmessage) {
+                  this._warnedErr = true;
+                  this.onmessage({
+                    data: JSON.stringify({ type: "error", message: `AI Engine: ${err.message || err}` }),
+                  });
+                }
+              })
               .finally(() => { inferBusy = false; });
           }
 
-          const ren = renderAnnotatedCanvas(fCan, activeTracked, this._sessState, true, null);
+          const loadingTag = !edge.ortSession ? `Loading AI ${edge.modelLoadingPct}%...` : null;
+          const ren = renderAnnotatedCanvas(fCan, activeTracked, this._sessState, true, loadingTag);
           const renderMs = Math.max(1, performance.now() - now);
           const curFrame = Math.min(totalFrames, Math.round(vid.currentTime * 15) + 1);
           tickCount++;
