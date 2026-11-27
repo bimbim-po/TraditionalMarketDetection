@@ -101,6 +101,15 @@ class ROIPolygonEditor {
     const stageRect = this.stageEl.getBoundingClientRect();
     const sw = Math.max(1, stageRect.width);
     const sh = Math.max(1, stageRect.height);
+
+    const edgeCanvas = document.getElementById("edge-video-canvas");
+    if (edgeCanvas && !edgeCanvas.classList.contains("hidden") && edgeCanvas.width && edgeCanvas.height) {
+      const scale = Math.min(sw / edgeCanvas.width, sh / edgeCanvas.height);
+      const rw = edgeCanvas.width * scale;
+      const rh = edgeCanvas.height * scale;
+      return { offsetX: (sw - rw) * 0.5, offsetY: (sh - rh) * 0.5, width: rw, height: rh };
+    }
+
     const natW = (this.mediaEl && this.mediaEl.naturalWidth) || 960;
     const natH = (this.mediaEl && this.mediaEl.naturalHeight) || 540;
 

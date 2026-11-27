@@ -58,13 +58,17 @@
 
   const edge = {
     manifest: null,
-    ortSession: null,
+    worker: null,
+    workerReady: false,
     sessionPromise: null,
     modelLoadingPct: 0,
+    nextReqId: 1,
+    pendingReqs: new Map(),
     inferMutex: Promise.resolve(),
     activeModelName: "best.pt",
     isFallback: false,
-    imgsz: 480,
+    imageSide: 640,
+    videoSide: 416,
     names: { 0: "cart", 1: "customer", 2: "scale", 3: "seller", 4: "vegetables" },
 
     conf: 0.35,
@@ -96,61 +100,62 @@
     latestSource: null,
   };
 
+  function getOrCreateWorker() {
+    if (edge.worker) return edge.worker;
+    const w = new Worker("/static/js/yolo_worker.js?v=4", { type: "module" });
+    w.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === "progress") {
+        edge.modelLoadingPct = msg.pct;
+      } else if (msg.type === "ready") {
+        edge.workerReady = true;
+        edge.modelLoadingPct = 100;
+        if (msg.names) edge.names = msg.names;
+        if (edge._resolveReady) {
+          edge._resolveReady(true);
+          edge._resolveReady = null;
+        }
+      } else if (msg.type === "customLoaded" || msg.type === "result") {
+        const cb = edge.pendingReqs.get(msg.reqId);
+        if (cb) {
+          edge.pendingReqs.delete(msg.reqId);
+          cb.resolve(msg);
+        }
+      } else if (msg.type === "error") {
+        if (msg.reqId && edge.pendingReqs.has(msg.reqId)) {
+          const cb = edge.pendingReqs.get(msg.reqId);
+          edge.pendingReqs.delete(msg.reqId);
+          cb.reject(new Error(msg.message));
+        } else if (edge._rejectReady) {
+          edge._rejectReady(new Error(msg.message));
+          edge._rejectReady = null;
+          edge.sessionPromise = null;
+        }
+      }
+    };
+    w.onerror = (err) => {
+      console.error("[PasarVision Worker Error]", err);
+      if (edge._rejectReady) {
+        edge._rejectReady(new Error("AI Web Worker error"));
+        edge._rejectReady = null;
+      }
+      edge.sessionPromise = null;
+    };
+    edge.worker = w;
+    return w;
+  }
+
   async function ensureModelLoaded() {
-    if (edge.ortSession) return edge.ortSession;
+    if (edge.workerReady) return true;
     if (edge.sessionPromise) return edge.sessionPromise;
 
-    edge.sessionPromise = (async () => {
-      try {
-        await loadScriptOnce("/static/ort/ort.wasm.min.js");
-        window.ort.env.wasm.wasmPaths = "/static/ort/";
-        window.ort.env.wasm.numThreads = 1;
-        window.ort.env.wasm.simd = true;
-
-        const mRes = await origFetch("/model/manifest_v3.json", { cache: "no-store" });
-        if (!mRes.ok) throw new Error("Failed to fetch model manifest_v3.json");
-        const manifest = await mRes.json();
-        edge.manifest = manifest;
-        edge.imgsz = manifest.imgsz || 416;
-        edge.names = manifest.names || edge.names;
-        if (manifest.samples && edge.samples.images.length === 0) {
-          edge.samples = JSON.parse(JSON.stringify(manifest.samples));
-        }
-
-        let loadedCount = 0;
-        const totalChunks = manifest.chunks.length;
-        const buffers = await Promise.all(
-          manifest.chunks.map((c) =>
-            origFetch(c.file).then(async (r) => {
-              if (!r.ok) throw new Error(`Failed chunk ${c.file}`);
-              const ab = await r.arrayBuffer();
-              loadedCount++;
-              edge.modelLoadingPct = Math.round((loadedCount / totalChunks) * 100);
-              return ab;
-            })
-          )
-        );
-
-        const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);
-        const merged = new Uint8Array(total);
-        let offset = 0;
-        for (const b of buffers) {
-          merged.set(new Uint8Array(b), offset);
-          offset += b.byteLength;
-        }
-
-        edge.ortSession = await window.ort.InferenceSession.create(merged, {
-          executionProviders: ["wasm"],
-          graphOptimizationLevel: "all",
-        });
-        edge.modelLoadingPct = 100;
-        return edge.ortSession;
-      } catch (err) {
-        console.error("[PasarVision Edge] Model init failed:", err);
-        edge.sessionPromise = null;
-        throw err;
-      }
-    })();
+    edge.sessionPromise = new Promise((resolve, reject) => {
+      edge._resolveReady = resolve;
+      edge._rejectReady = reject;
+      ensureManifestSamples().catch(() => {});
+      const w = getOrCreateWorker();
+      w.postMessage({ type: "init" });
+    });
 
     return edge.sessionPromise;
   }
@@ -158,17 +163,21 @@
   async function ensureManifestSamples() {
     if (edge.manifest) return;
     try {
-      const mRes = await origFetch("/model/manifest_v3.json", { cache: "no-store" });
+      const mRes = await origFetch("/model/manifest_v4.json", { cache: "no-store" });
       if (!mRes.ok) return;
       const manifest = await mRes.json();
       edge.manifest = manifest;
-      edge.imgsz = manifest.imgsz || 416;
+      edge.imageSide = manifest.image_side || 640;
+      edge.videoSide = manifest.video_side || 416;
       edge.names = manifest.names || edge.names;
       if (manifest.samples && edge.samples.images.length === 0) {
         edge.samples = JSON.parse(JSON.stringify(manifest.samples));
       }
     } catch (_) {}
   }
+
+  // Kick off background AI worker + chunk download immediately on page open
+  ensureModelLoaded().catch(() => {});
 
   function describeEnhancement(cfg) {
     if (cfg.method === "none") return "Original (No Enhancement)";
@@ -508,103 +517,85 @@
   const letterCanvas = document.createElement("canvas");
   const letterCtx = letterCanvas.getContext("2d", { willReadFrequently: true });
 
-  function runYoloOnCanvas(sourceCanvas, scoreFloor) {
-    const task = edge.inferMutex.then(() => _runYoloOnCanvasInternal(sourceCanvas, scoreFloor));
+  function runYoloOnCanvas(sourceCanvas, scoreFloor, targetSide = edge.imageSide) {
+    const task = edge.inferMutex.then(() =>
+      _runYoloOnCanvasInternal(sourceCanvas, scoreFloor, targetSide)
+    );
     edge.inferMutex = task.catch(() => {});
     return task;
   }
 
-  async function _runYoloOnCanvasInternal(sourceCanvas, scoreFloor) {
-    const sess = await ensureModelLoaded();
+  async function _runYoloOnCanvasInternal(sourceCanvas, scoreFloor, targetSide) {
+    await ensureModelLoaded();
     const w0 = sourceCanvas.width;
     const h0 = sourceCanvas.height;
-    const sz = edge.imgsz;
+    const side = targetSide || edge.videoSide || 416;
 
-    letterCanvas.width = sz;
-    letterCanvas.height = sz;
+    const ratio = Math.min(side / h0, side / w0);
+    const nw = Math.round(w0 * ratio);
+    const nh = Math.round(h0 * ratio);
+    const W = Math.max(32, Math.ceil(nw / 32) * 32);
+    const H = Math.max(32, Math.ceil(nh / 32) * 32);
+    const padX = Math.floor((W - nw) * 0.5);
+    const padY = Math.floor((H - nh) * 0.5);
+
+    if (letterCanvas.width !== W || letterCanvas.height !== H) {
+      letterCanvas.width = W;
+      letterCanvas.height = H;
+    }
     letterCtx.fillStyle = "rgb(114,114,114)";
-    letterCtx.fillRect(0, 0, sz, sz);
-
-    const r = Math.min(sz / h0, sz / w0);
-    const nw = Math.round(w0 * r);
-    const nh = Math.round(h0 * r);
-    const padX = Math.round((sz - nw) * 0.5);
-    const padY = Math.round((sz - nh) * 0.5);
+    letterCtx.fillRect(0, 0, W, H);
     letterCtx.drawImage(sourceCanvas, padX, padY, nw, nh);
 
-    const imgData = letterCtx.getImageData(0, 0, sz, sz).data;
-    const plane = sz * sz;
-    const floatData = new Float32Array(3 * plane);
-    for (let i = 0, p = 0; i < plane; i++, p += 4) {
-      floatData[i] = imgData[p] / 255.0;
-      floatData[plane + i] = imgData[p + 1] / 255.0;
-      floatData[2 * plane + i] = imgData[p + 2] / 255.0;
-    }
+    const imgData = letterCtx.getImageData(0, 0, W, H).data;
+    const enabledIds =
+      edge.enabledClassIds === null ? null : Array.from(edge.enabledClassIds);
+    if (enabledIds && enabledIds.length === 0) return [];
 
-    const inputName = sess.inputNames[0];
-    const tensor = new window.ort.Tensor("float32", floatData, [1, 3, sz, sz]);
-    const outMap = await sess.run({ [inputName]: tensor });
-    const outTensor = outMap[sess.outputNames[0]];
-    const dims = outTensor.dims; // [1, 4 + nc, numAnchors]
-    const data = outTensor.data;
-
-    const channels = dims[1];
-    const nc = channels - 4;
-    const anchors = dims[2];
-    const enabledSet = edge.enabledClassIds === null ? null : new Set(edge.enabledClassIds);
-    if (enabledSet && enabledSet.size === 0) return [];
-
-    const candidates = [];
-    for (let a = 0; a < anchors; a++) {
-      let bestC = -1;
-      let bestS = scoreFloor;
-      for (let c = 0; c < nc; c++) {
-        if (enabledSet && !enabledSet.has(c)) continue;
-        const sc = data[(4 + c) * anchors + a];
-        if (sc >= bestS) {
-          bestS = sc;
-          bestC = c;
-        }
-      }
-      if (bestC === -1) continue;
-
-      const cx = data[0 * anchors + a];
-      const cy = data[1 * anchors + a];
-      const bw = data[2 * anchors + a];
-      const bh = data[3 * anchors + a];
-
-      const x1 = Math.max(0, Math.min(w0 - 1, (cx - bw * 0.5 - padX) / r));
-      const y1 = Math.max(0, Math.min(h0 - 1, (cy - bh * 0.5 - padY) / r));
-      const x2 = Math.max(0, Math.min(w0 - 1, (cx + bw * 0.5 - padX) / r));
-      const y2 = Math.max(0, Math.min(h0 - 1, (cy + bh * 0.5 - padY) / r));
-      candidates.push({ bbox: [x1, y1, x2, y2], conf: bestS, cls: bestC });
-    }
-
-    // Class-aware NMS
-    candidates.sort((a, b) => b.conf - a.conf);
-    const kept = [];
-    for (const cand of candidates) {
-      let sup = false;
-      for (const k of kept) {
-        if (k.cls === cand.cls && boxIoU(k.bbox, cand.bbox) > edge.iou) {
-          sup = true;
-          break;
-        }
-      }
-      if (!sup) kept.push(cand);
-    }
-    return kept;
+    const reqId = edge.nextReqId++;
+    const w = getOrCreateWorker();
+    const res = await new Promise((resolve, reject) => {
+      edge.pendingReqs.set(reqId, { resolve, reject });
+      w.postMessage(
+        {
+          type: "infer",
+          reqId,
+          rgbaBuffer: imgData.buffer,
+          W,
+          H,
+          padX,
+          padY,
+          ratio,
+          w0,
+          h0,
+          scoreFloor,
+          iou: edge.iou,
+          enabledIds,
+        },
+        [imgData.buffer]
+      );
+    });
+    return res.dets || [];
   }
 
-  function renderAnnotatedCanvas(baseCanvas, dets, sessionTrackerState, useTracking, cornerTag) {
-    const outC = document.createElement("canvas");
-    outC.width = baseCanvas.width;
-    outC.height = baseCanvas.height;
+  function paintAnnotatedTarget(
+    outC,
+    baseSource,
+    w,
+    h,
+    dets,
+    sessionTrackerState,
+    useTracking,
+    cornerTag,
+    encodeJpg = true
+  ) {
+    if (outC.width !== w || outC.height !== h) {
+      outC.width = w;
+      outC.height = h;
+    }
     const ctx = outC.getContext("2d");
-    ctx.drawImage(baseCanvas, 0, 0);
+    ctx.drawImage(baseSource, 0, 0, w, h);
 
-    const w = outC.width;
-    const h = outC.height;
     const polyPx = edge.roi.map((p) => [p[0] * w, p[1] * h]);
 
     let insideNow = 0;
@@ -746,7 +737,7 @@
       useTracking && sessionTrackerState ? sessionTrackerState.roiIds.size : insideNow;
 
     return {
-      dataUrl: outC.toDataURL("image/jpeg", 0.84),
+      dataUrl: encodeJpg ? outC.toDataURL("image/jpeg", 0.84) : null,
       total: dets.length,
       avgConf: Number(avgConf.toFixed(4)),
       insideNow,
@@ -767,6 +758,21 @@
                 confidence: Number(d.conf.toFixed(4)),
               })),
     };
+  }
+
+  function renderAnnotatedCanvas(baseCanvas, dets, sessionTrackerState, useTracking, cornerTag) {
+    const outC = document.createElement("canvas");
+    return paintAnnotatedTarget(
+      outC,
+      baseCanvas,
+      baseCanvas.width,
+      baseCanvas.height,
+      dets,
+      sessionTrackerState,
+      useTracking,
+      cornerTag,
+      true
+    );
   }
 
   function resolveMediaUrl(sourcePath) {
@@ -943,9 +949,11 @@
         edge.enhancement.method === "none"
           ? bCan
           : makeEnhancedCanvas(img, w, h, edge.enhancement);
-      const bDets = await runYoloOnCanvas(bCan, edge.conf);
+      const bDets = await runYoloOnCanvas(bCan, edge.conf, edge.videoSide);
       const aDets =
-        edge.enhancement.method === "none" ? bDets : await runYoloOnCanvas(aCan, edge.conf);
+        edge.enhancement.method === "none"
+          ? bDets
+          : await runYoloOnCanvas(aCan, edge.conf, edge.videoSide);
 
       const bRen = renderAnnotatedCanvas(bCan, bDets, null, false, "BEFORE | ORIGINAL");
       const aRen = renderAnnotatedCanvas(
@@ -1041,9 +1049,11 @@
         edge.enhancement.method === "none"
           ? bCan
           : makeEnhancedCanvas(vid, w, h, edge.enhancement);
-      const bDets = await runYoloOnCanvas(bCan, edge.conf);
+      const bDets = await runYoloOnCanvas(bCan, edge.conf, edge.videoSide);
       const aDets =
-        edge.enhancement.method === "none" ? bDets : await runYoloOnCanvas(aCan, edge.conf);
+        edge.enhancement.method === "none"
+          ? bDets
+          : await runYoloOnCanvas(aCan, edge.conf, edge.videoSide);
 
       const tracked = tracker.update(aDets, edge.conf);
       sessState.tsSec = Number(t.toFixed(2));
@@ -1300,7 +1310,7 @@
           this._vid.play().catch(() => {});
         }
       } else if (msg.action === "seek" && this._vid) {
-        const total = Math.max(1, Math.round((this._vid.duration || 5) * 15));
+        const total = Math.max(1, Math.round((this._vid.duration || 5) * 30));
         this._vid.currentTime = (Number(msg.frame || 0) / total) * (this._vid.duration || 5);
       }
     }
@@ -1308,6 +1318,8 @@
     close() {
       this._stopped = true;
       this.readyState = 3;
+      const edgeCanvas = document.getElementById("edge-video-canvas");
+      if (edgeCanvas) edgeCanvas.classList.add("hidden");
       if (this._vid) {
         this._vid.pause();
         this._vid.src = "";
@@ -1317,7 +1329,7 @@
 
     async _runLoop(source) {
       try {
-        // Trigger model preload in background without blocking immediate video playback!
+        // Trigger background Web Worker model load immediately
         ensureModelLoaded().catch(() => {});
 
         const vid = document.createElement("video");
@@ -1336,15 +1348,27 @@
 
         this._tracker = new JSByteTracker();
         this._sessState = { uniqueAll: new Set(), roiIds: new Set(), roiLog: [], trails: {} };
-        const totalFrames = Math.max(1, Math.round((vid.duration || 5) * 15));
+        const totalFrames = Math.max(1, Math.round((vid.duration || 5) * 30));
         const frameLog = [];
+
+        const edgeCanvas = document.getElementById("edge-video-canvas");
+        const mainImg = document.getElementById("main-viewport-img");
+        if (mainImg) mainImg.classList.add("hidden");
+        if (edgeCanvas) edgeCanvas.classList.remove("hidden");
+
+        // Preallocated offscreen canvas for async worker snapshots
+        const snapC = document.createElement("canvas");
+        const snapCtx = snapC.getContext("2d");
 
         await vid.play().catch(() => {});
 
         let activeTracked = [];
+        let detWallT = performance.now();
+        const prevCenters = new Map();
+        const vels = new Map();
         let inferBusy = false;
         let lastFpsT = performance.now();
-        let fpsEma = 58.0;
+        let fpsEma = 59.0;
         let tickCount = 0;
 
         const stepDisplay = () => {
@@ -1375,68 +1399,165 @@
 
           const rawW = vid.videoWidth || 640;
           const rawH = vid.videoHeight || 360;
-          const scale = rawW > 768 ? 768 / rawW : 1;
+          const scale = rawW > 854 ? 854 / rawW : 1;
           const w = Math.round(rawW * scale);
           const h = Math.round(rawH * scale);
-          const fCan = makeEnhancedCanvas(vid, w, h, edge.enhancement);
 
-          if (!inferBusy) {
+          // Fast path: draw HTMLVideoElement directly via GPU when enhancement is 'none'
+          const baseSource =
+            edge.enhancement.method === "none"
+              ? vid
+              : makeEnhancedCanvas(vid, w, h, edge.enhancement);
+
+          if (!inferBusy && vid.readyState >= 2) {
             inferBusy = true;
-            const snapC = document.createElement("canvas");
-            snapC.width = w;
-            snapC.height = h;
-            snapC.getContext("2d").drawImage(fCan, 0, 0);
+            if (snapC.width !== w || snapC.height !== h) {
+              snapC.width = w;
+              snapC.height = h;
+            }
+            snapCtx.drawImage(baseSource, 0, 0, w, h);
             const snapTime = Number(vid.currentTime.toFixed(2));
-            runYoloOnCanvas(snapC, Math.max(0.12, edge.conf * 0.5))
+            runYoloOnCanvas(snapC, Math.max(0.12, edge.conf * 0.5), edge.videoSide)
               .then((rawDets) => {
-                if (!this._stopped) {
-                  this._sessState.tsSec = snapTime;
-                  activeTracked = this._tracker.update(rawDets, edge.conf);
+                if (this._stopped) return;
+                const doneT = performance.now();
+                this._sessState.tsSec = snapTime;
+                const tracked = this._tracker.update(rawDets, edge.conf);
+
+                for (const d of tracked) {
+                  if (!d.trackId) continue;
+                  const cx = (d.bbox[0] + d.bbox[2]) * 0.5;
+                  const cy = (d.bbox[1] + d.bbox[3]) * 0.5;
+                  const prev = prevCenters.get(d.trackId);
+                  if (prev) {
+                    const dtS = Math.max(0.02, (doneT - prev.t) * 0.001);
+                    const vx = (cx - prev.cx) / dtS;
+                    const vy = (cy - prev.cy) / dtS;
+                    const oldV = vels.get(d.trackId) || [0, 0];
+                    vels.set(d.trackId, [0.5 * oldV[0] + 0.5 * vx, 0.5 * oldV[1] + 0.5 * vy]);
+                  }
+                  prevCenters.set(d.trackId, { cx, cy, t: doneT });
                 }
+                activeTracked = tracked;
+                detWallT = doneT;
               })
               .catch((err) => {
                 console.error("[PasarVision Edge Video Infer]", err);
                 if (!this._warnedErr && this.onmessage) {
                   this._warnedErr = true;
                   this.onmessage({
-                    data: JSON.stringify({ type: "error", message: `AI Engine: ${err.message || err}` }),
+                    data: JSON.stringify({
+                      type: "error",
+                      message: `AI Engine: ${err.message || err}`,
+                    }),
                   });
                 }
               })
-              .finally(() => { inferBusy = false; });
+              .finally(() => {
+                inferBusy = false;
+              });
           }
 
-          const loadingTag = !edge.ortSession ? `Loading AI ${edge.modelLoadingPct}%...` : null;
-          const ren = renderAnnotatedCanvas(fCan, activeTracked, this._sessState, true, loadingTag);
-          const renderMs = Math.max(1, performance.now() - now);
-          const curFrame = Math.min(totalFrames, Math.round(vid.currentTime * 15) + 1);
+          // Velocity extrapolation for fluid 60 FPS box motion between worker detections
+          const dtSec = Math.min(0.12, Math.max(0, (now - detWallT) * 0.001));
+          const smoothTracked = activeTracked.map((d) => {
+            const v = d.trackId ? vels.get(d.trackId) : null;
+            if (!v || dtSec <= 0.001) return { ...d, bbox: d.bbox.slice() };
+            const dx = Math.max(-28, Math.min(28, v[0] * dtSec));
+            const dy = Math.max(-28, Math.min(28, v[1] * dtSec));
+            return {
+              ...d,
+              bbox: [
+                Math.max(0, Math.min(w - 1, d.bbox[0] + dx)),
+                Math.max(0, Math.min(h - 1, d.bbox[1] + dy)),
+                Math.max(0, Math.min(w - 1, d.bbox[2] + dx)),
+                Math.max(0, Math.min(h - 1, d.bbox[3] + dy)),
+              ],
+            };
+          });
+
+          const loadingTag = !edge.workerReady ? `Loading AI ${edge.modelLoadingPct}%...` : null;
+          const prevW = edgeCanvas ? edgeCanvas.width : 0;
+          const ren = paintAnnotatedTarget(
+            edgeCanvas,
+            baseSource,
+            w,
+            h,
+            smoothTracked,
+            this._sessState,
+            true,
+            loadingTag,
+            false
+          );
+          if (prevW !== w && window.dispatchEvent) {
+            window.dispatchEvent(new Event("resize"));
+          }
+
+          const renderMs = Math.max(0.5, performance.now() - now);
+          const curFrame = Math.min(totalFrames, Math.round(vid.currentTime * 30) + 1);
           tickCount++;
 
-          if (this.onmessage && !this._stopped) {
-            this.onmessage({
-              data: JSON.stringify({
-                type: "frame",
-                image: ren.dataUrl,
-                frame_idx: curFrame,
-                total_frames: totalFrames,
-                fps: Number(fpsEma.toFixed(1)),
-                latency_ms: Number(renderMs.toFixed(1)),
-                width: w,
-                height: h,
-                enhancement_description: describeEnhancement(edge.enhancement),
-                telemetry: {
-                  total_detections: ren.total,
+          if (tickCount === 1 || tickCount % 8 === 0) {
+            if (tickCount % 16 === 0) {
+              frameLog.push({
+                frame_or_file: `Frame #${curFrame}`,
+                timestamp_sec: Number(vid.currentTime.toFixed(2)),
+                before_detections: ren.total,
+                after_detections: ren.total,
+                before_avg_conf: ren.avgConf,
+                after_avg_conf: ren.avgConf,
+                inside_roi_count: ren.insideNow,
+              });
+              edge.latestSource = source;
+              edge.latestReportData = {
+                mode: "Live Video Tracking (Cloudflare Edge)",
+                source_type: "video",
+                source_name: source.split("/").pop(),
+                summary: {
+                  model_badge: buildModelStatus().badge_text,
+                  enhancement_method: edge.enhancement.method,
+                  enhancement_description: describeEnhancement(edge.enhancement),
+                  conf_threshold: edge.conf,
+                  before_total: ren.total,
+                  after_total: ren.total,
+                  delta_count: 0,
+                  delta_pct: 0,
+                  before_avg_conf: ren.avgConf,
+                  after_avg_conf: ren.avgConf,
+                  delta_conf: 0,
                   unique_tracked_total: ren.uniqueTot,
-                  inside_roi_now: ren.insideNow,
-                  inside_roi_by_class: ren.insideByClass,
                   region_unique_entered: ren.roiEnteredTot,
-                  avg_confidence: ren.avgConf,
-                  current_counts_by_class: ren.countsByClass,
-                  class_colors: ren.classColors,
-                  region_counter_log: ren.roiLog,
                 },
-              }),
-            });
+                per_class_table: [],
+                frame_detail_log: frameLog.slice(-50),
+                region_counter_log: this._sessState.roiLog,
+              };
+            }
+
+            if (this.onmessage && !this._stopped) {
+              this.onmessage({
+                data: JSON.stringify({
+                  type: "hud",
+                  frame_idx: curFrame,
+                  total_frames: totalFrames,
+                  fps: Number(fpsEma.toFixed(1)),
+                  latency_ms: Number(renderMs.toFixed(1)),
+                  width: w,
+                  height: h,
+                  telemetry: {
+                    total_detections: ren.total,
+                    unique_tracked_total: ren.uniqueTot,
+                    inside_roi_now: ren.insideNow,
+                    inside_roi_by_class: ren.insideByClass,
+                    region_unique_entered: ren.roiEnteredTot,
+                    avg_confidence: ren.avgConf,
+                    current_counts_by_class: ren.countsByClass,
+                    class_colors: ren.classColors,
+                    region_counter_log: ren.roiLog,
+                  },
+                }),
+              });
+            }
           }
           requestAnimationFrame(stepDisplay);
         };
@@ -1551,11 +1672,14 @@
             400
           );
         }
-        await loadScriptOnce("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js");
         const ab = await file.arrayBuffer();
-        edge.ortSession = await window.ort.InferenceSession.create(new Uint8Array(ab), {
-          executionProviders: ["wasm"],
+        const reqId = edge.nextReqId++;
+        const w = getOrCreateWorker();
+        await new Promise((resolve, reject) => {
+          edge.pendingReqs.set(reqId, { resolve, reject });
+          w.postMessage({ type: "loadCustomOnnx", reqId, buffer: ab }, [ab]);
         });
+        edge.workerReady = true;
         edge.activeModelName = file.name;
         return jsonResp(buildFullStatus());
       }

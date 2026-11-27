@@ -386,6 +386,10 @@
   }
 
   function showFrame(b64) {
+    const edgeCanvas = document.getElementById("edge-video-canvas");
+    if (edgeCanvas && !edgeCanvas.classList.contains("hidden")) {
+      edgeCanvas.classList.add("hidden");
+    }
     const img = document.getElementById("main-viewport-img");
     if (img.classList.contains("hidden")) {
       img.classList.remove("hidden");
@@ -530,6 +534,7 @@
         return;
       }
       if (msg.type === "hud") {
+        setLoader(false);
         document.getElementById("hud-fps").textContent = `${Number(msg.fps).toFixed(1)} fps`;
         document.getElementById("hud-latency").textContent = `${Math.round(msg.latency_ms)} ms`;
         const sl = document.getElementById("slider-vid-progress");
@@ -917,6 +922,11 @@
       .getElementById("btn-open-in-lab")
       .addEventListener("click", () => switchTab("compare"));
     document.getElementById("btn-save-annotated-img").addEventListener("click", () => {
+      const edgeC = document.getElementById("edge-video-canvas");
+      if (edgeC && !edgeC.classList.contains("hidden") && edgeC.width > 0) {
+        downloadUrl(edgeC.toDataURL("image/jpeg", 0.92), `snapshot_${Date.now()}.jpg`);
+        return;
+      }
       if (state.lastAnnotatedB64) downloadUrl(state.lastAnnotatedB64, `snapshot_${Date.now()}.jpg`);
     });
 
